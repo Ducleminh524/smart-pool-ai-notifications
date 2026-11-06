@@ -1,141 +1,210 @@
-"""Scheduled metadata-only monitoring of Roboflow and Kaggle notebooks."""
+"""Monitor Roboflow project + one Kaggle account, route events to separate Slack channels."""
+import csv
+import io
 import json
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
-from datetime import datetime, timezone
+from urllib.parse import quote
 
 import requests
 
 STATE_PATH = Path('state/monitor.json')
-TIMEOUT = 25
+TIMEOUT = 30
+REF_PATTERN = re.compile(r'^[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$')
 
 
-def env(name, default=''):
-    return os.getenv(name, default).strip()
+def env(name):
+    return os.environ.get(name, '').strip()
 
 
-def send_slack(message):
-    url = env('SLACK_WEBHOOK_URL')
+def send_slack(source, message):
+    var = {'roboflow': 'ROBOFLOW_SLACK_WEBHOOK_URL', 'kaggle': 'KAGGLE_SLACK_WEBHOOK_URL'}[source]
+    url = env(var)
     if not url:
-        raise RuntimeError('SLACK_WEBHOOK_URL is missing')
-    r = requests.post(url, json={'text': message}, timeout=TIMEOUT)
-    r.raise_for_status()
-    if r.text.strip() != 'ok':
-        raise RuntimeError(f'Slack rejected message: {r.status_code}')
+        raise RuntimeError(f'{var} is missing')
+    resp = requests.post(url, json={'text': message}, timeout=TIMEOUT)
+    resp.raise_for_status()
+    if resp.text.strip() != 'ok':
+        raise RuntimeError(f'{source} Slack webhook rejected notification ({resp.status_code})')
 
 
-def get_state():
-    if STATE_PATH.exists():
-        return json.loads(STATE_PATH.read_text(encoding='utf-8'))
-    return {}
+def load_state():
+    if not STATE_PATH.exists():
+        return {}
+    data = json.loads(STATE_PATH.read_text(encoding='utf-8'))
+    if not isinstance(data, dict):
+        raise ValueError('state/monitor.json must be a JSON object')
+    return data
+
+
+def save_state(state):
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_PATH.with_suffix('.tmp')
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+    tmp.replace(STATE_PATH)
 
 
 def get_roboflow():
-    key, workspace, project = (env(k) for k in ['ROBOFLOW_API_KEY', 'ROBOFLOW_WORKSPACE', 'ROBOFLOW_PROJECT'])
-    if not all((key, workspace, project)):
-        print('Roboflow: missing configuration; skipped')
+    key, ws, project = (env(x) for x in ('ROBOFLOW_API_KEY', 'ROBOFLOW_WORKSPACE', 'ROBOFLOW_PROJECT'))
+    if not any((key, ws, project)):
         return None
-    url = f'https://api.roboflow.com/{workspace}/{project}'
-    resp = requests.get(url, params={'api_key': key}, timeout=TIMEOUT)
+    if not all((key, ws, project)):
+        raise RuntimeError('Roboflow config incomplete: API_KEY, WORKSPACE, PROJECT required')
+    resp = requests.get(
+        f'https://api.roboflow.com/{quote(ws, safe="")}/{quote(project, safe="")}',
+        params={'api_key': key}, timeout=TIMEOUT,
+    )
     resp.raise_for_status()
     data = resp.json()
-    if 'error' in data:
-        raise RuntimeError(f'Roboflow API error: {str(data["error"])[:160]}')
-    p = data.get('project', data)
-    # Keep only stable, documented project metadata; do not retain secrets or large payloads.
-    versions = p.get('versions', data.get('versions', []))
-    version_ids = []
-    for v in versions if isinstance(versions, list) else []:
-        if isinstance(v, dict):
-            val = v.get('version', v.get('id'))
-        else:
-            val = v
-        if val is not None:
-            version_ids.append(str(val))
-    version_ids = sorted(set(version_ids))
-    fields = ['images', 'unannotated']
-    stats = {name: p[name] for name in fields if isinstance(p.get(name), (int, float))}
-    return {'versions': version_ids, 'counts': stats, 'url': f'https://app.roboflow.com/{workspace}/{project}'}
+    if not isinstance(data, dict) or 'error' in data:
+        raise RuntimeError('Roboflow returned an API error or invalid JSON schema')
+    metadata = data.get('project', data)
+    versions = data.get('versions', metadata.get('versions', []))
+    if not isinstance(metadata, dict) or not isinstance(versions, list):
+        raise RuntimeError('Roboflow project API response has unexpected structure')
+    identifiers = []
+    for item in versions:
+        version = item.get('version', item.get('id')) if isinstance(item, dict) else item
+        if version is not None:
+            identifiers.append(str(version))
+    counts = {name: metadata.get(name) for name in ('images', 'unannotated')
+              if isinstance(metadata.get(name), (int, float)) and not isinstance(metadata.get(name), bool)}
+    return {
+        'versions': sorted(set(identifiers)),
+        'counts': counts,
+        'url': f'https://app.roboflow.com/{quote(ws, safe="")}/{quote(project, safe="")}',
+    }
 
 
-def kaggle_status(notebook):
-    # CLI returns human-readable status in the currently documented interface.
-    proc = subprocess.run(['kaggle', 'kernels', 'status', notebook], capture_output=True, text=True, timeout=45)
+def cli(args):
+    proc = subprocess.run(['kaggle', *args], capture_output=True, text=True, timeout=90)
     if proc.returncode:
-        raise RuntimeError('Kaggle status failed for ' + notebook + ': ' + (proc.stderr or proc.stdout)[-400:])
-    output = (proc.stdout + '\n' + proc.stderr).strip()
-    # Normalize only known state words, avoid changing state from varying timestamps.
+        # Don't include raw CLI output, as providers may echo sensitive text.
+        raise RuntimeError('Kaggle command failed: ' + ' '.join(args[:2]) + f' (exit {proc.returncode})')
+    return proc.stdout
+
+
+def list_kaggle_notebooks(username):
+    """Discover own notebooks in Kaggle; CSV provides a parseable 'ref' column."""
+    refs = set()
+    for page in range(1, 11):  # up to 1000 notebooks
+        output = cli(['kernels', 'list', '--user', username, '--sort-by', 'dateRun',
+                      '--page-size', '100', '--page', str(page), '--csv'])
+        rows = list(csv.DictReader(io.StringIO(output)))
+        if rows and not any(k and k.strip().lower() in ('ref', 'id') for k in rows[0]):
+            raise RuntimeError('Kaggle CLI CSV response lacks a ref/id column')
+        for row in rows:
+            ref = next((v for k, v in row.items() if k and k.strip().lower() in ('ref', 'id')), '')
+            if ref and REF_PATTERN.fullmatch(ref.strip()) and ref.split('/')[0].lower() == username.lower():
+                refs.add(ref.strip())
+        if len(rows) < 100:
+            break
+    else:
+        print('Warning: Kaggle notebook list capped at 1000; consider a notebook allowlist', file=sys.stderr)
+    return sorted(refs)
+
+
+def kaggle_status(ref):
+    output = cli(['kernels', 'status', ref])
+    # The CLI prints the status of the latest saved/versioned run (not an interactive session).
     match = re.search(r'\b(complete|completed|error|failed|failure|running|queued|pending|cancelled|canceled)\b', output, re.I)
-    normalized = match.group(1).lower() if match else output[:180]
-    if normalized == 'completed':
-        normalized = 'complete'
-    if normalized in ('failed', 'failure'):
-        normalized = 'error'
-    return normalized
+    if not match:
+        raise RuntimeError(f'Unable to parse Kaggle notebook status for {ref}')
+    result = match.group(1).lower()
+    return {'completed': 'complete', 'failed': 'error', 'failure': 'error',
+            'canceled': 'cancelled'}.get(result, result)
 
 
 def get_kaggle():
-    refs = [s.strip() for s in env('KAGGLE_NOTEBOOKS').split(',') if s.strip()]
-    if not refs:
-        print('Kaggle: no notebooks configured; skipped')
+    username = env('KAGGLE_ACCOUNT_USERNAME')
+    explicit = [x.strip() for x in env('KAGGLE_NOTEBOOKS').split(',') if x.strip()]
+    if not username and not explicit:
         return None
-    result = {}
-    for ref in refs:
-        if not re.fullmatch(r'[A-Za-z0-9_-]+/[A-Za-z0-9_-]+', ref):
-            raise ValueError('Invalid KAGGLE_NOTEBOOKS entry: ' + ref)
-        result[ref] = kaggle_status(ref)
-    return result
+    if username and not re.fullmatch(r'[A-Za-z0-9_-]+', username):
+        raise ValueError('Invalid KAGGLE_ACCOUNT_USERNAME')
+    if username:
+        discovered = list_kaggle_notebooks(username)
+        refs = sorted(set(discovered + explicit))
+    else:
+        refs = sorted(set(explicit))
+    if any(not REF_PATTERN.fullmatch(r) for r in refs):
+        raise ValueError('Invalid notebook ref (expected username/notebook-slug)')
+    return {ref: kaggle_status(ref) for ref in refs}
 
 
-def compare(old, new):
-    messages = []
-    if 'roboflow' in old and 'roboflow' in new:
-        a, b = old['roboflow'], new['roboflow']
-        added = sorted(set(b['versions']) - set(a.get('versions', [])))
-        for v in added:
-            messages.append(f'*Roboflow | Version mới*\nProject: <{b["url"]}|Mở Roboflow>\nVersion: `{v}`\nNgười thực hiện: Không có trong dữ liệu API được kiểm tra')
-        for key, new_count in b.get('counts', {}).items():
-            previous = a.get('counts', {}).get(key)
-            if previous is not None and new_count != previous:
-                messages.append(f'*Roboflow | Số lượng thay đổi*\nTrường: `{key}`\nTrước: {previous} → Sau: {new_count}\nProject: <{b["url"]}|Mở Roboflow>\nNgười thực hiện: Không xác định')
-    if 'kaggle' in old and 'kaggle' in new:
-        for ref, status in new['kaggle'].items():
-            before = old['kaggle'].get(ref)
-            if before is not None and before != status:
-                owner = ref.split('/')[0]
-                messages.append(f'*Kaggle | Trạng thái notebook thay đổi*\nNotebook: <https://www.kaggle.com/code/{ref}|{ref}>\nTrạng thái: `{before}` → `{status}`\nTài khoản sở hữu: `{owner}` (không đồng nghĩa người nhấn Run)')
-    return messages
+def changes_roboflow(previous, current):
+    msgs = []
+    old_versions = set(previous.get('versions', []))
+    for version in sorted(set(current['versions']) - old_versions):
+        msgs.append(f'*Roboflow | Dataset version mới*\nVersion: `{version}`\n'
+                    f'Project: <{current["url"]}|Xem project>\nNgười thực hiện: Không xác định qua metadata')
+    for field, new_value in current['counts'].items():
+        old_value = previous.get('counts', {}).get(field)
+        if old_value is not None and old_value != new_value:
+            label = {'images': 'Số ảnh', 'unannotated': 'Ảnh chưa gán nhãn'}.get(field, field)
+            msgs.append(f'*Roboflow | {label} thay đổi*\n{old_value} → {new_value}\n'
+                        f'Project: <{current["url"]}|Xem project>\nNgười thực hiện: Không xác định')
+    return msgs
+
+
+def changes_kaggle(previous, current):
+    msgs = []
+    for ref, status in current.items():
+        old_status = previous.get(ref)
+        if old_status is None:
+            msgs.append(f'*Kaggle | Phát hiện notebook mới*\nNotebook: '
+                        f'<https://www.kaggle.com/code/{ref}|{ref}>\n'
+                        f'Trạng thái hiện tại: `{status}`\nTài khoản sở hữu: `{ref.split("/")[0]}`')
+        elif old_status != status:
+            msgs.append(f'*Kaggle | Trạng thái notebook thay đổi*\nNotebook: '
+                        f'<https://www.kaggle.com/code/{ref}|{ref}>\n'
+                        f'Trạng thái: `{old_status}` → `{status}`\n'
+                        f'Tài khoản sở hữu: `{ref.split("/")[0]}` (không chắc là người nhấn Run)')
+    return msgs
 
 
 def main():
-    old = get_state()
-    new = dict(old)
+    state = load_state()
     errors = []
-    for name, fn in [('roboflow', get_roboflow), ('kaggle', get_kaggle)]:
+    processed = 0
+    source_configs = [('roboflow', get_roboflow, changes_roboflow),
+                      ('kaggle', get_kaggle, changes_kaggle)]
+    enabled = 0
+    for source, fetch, diff in source_configs:
         try:
-            result = fn()
-            if result is not None:
-                new[name] = result
+            new_value = fetch()
+            if new_value is None:
+                print(f'{source}: not configured; skipped')
+                continue
+            enabled += 1
+            prior = state.get(source)
+            # Each source has its own first-run baseline and own channel.
+            if prior is None:
+                send_slack(source, f'*{source.capitalize()} Monitor đã khởi tạo*\n'
+                            'Đã lưu trạng thái ban đầu; lần kiểm tra tiếp theo sẽ báo thay đổi.')
+                events = []
+            else:
+                events = diff(prior, new_value)
+            # Save state after each delivered event, then continue to the next event.
+            # If delivery fails, leave baseline unchanged, so the next run retries.
+            for msg in events:
+                send_slack(source, msg)
+                processed += 1
+            state[source] = new_value
+            save_state(state)
+            print(f'{source}: {len(events)} change notification(s)')
         except Exception as exc:
-            errors.append(f'{name}: {exc}')
-    if not any(x in new for x in ('roboflow', 'kaggle')):
-        raise RuntimeError('Neither data source is configured')
-    messages = compare(old, new)
-    if not STATE_PATH.exists():
-        messages.insert(0, '*AI Monitor đã khởi tạo*\nĐã lưu trạng thái đầu tiên. Những thay đổi tiếp theo sẽ tạo thông báo.')
-    for msg in messages:
-        send_slack(msg)
-    # Never mark undelivered notifications as processed.
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps(new, indent=2, ensure_ascii=False, sort_keys=True) + '\n', encoding='utf-8')
-    print(f'Notified: {len(messages)}; errors: {len(errors)}')
-    if errors:
-        print('\n'.join(errors), file=sys.stderr)
-        sys.exit(1)
+            errors.append(f'{source}: {type(exc).__name__}: {str(exc)[:250]}')
+    if not enabled and not errors:
+        errors.append('No source configured. Provide Roboflow config or Kaggle account username.')
+    print(f'Notifications sent: {processed}; errors: {len(errors)}')
+    for err in errors:
+        print(err, file=sys.stderr)
+    return 1 if errors else 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
