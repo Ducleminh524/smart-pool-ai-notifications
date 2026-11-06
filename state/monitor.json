@@ -1,0 +1,14 @@
+{
+  "roboflow": {
+    "counts": {
+      "images": 6654,
+      "unannotated": 0
+    },
+    "url": "https://app.roboflow.com/minhduc-wvgz7/drowning-detection-realtime",
+    "versions": [
+      "minhduc-wvgz7/drowning-detection-realtime/1",
+      "minhduc-wvgz7/drowning-detection-realtime/2",
+      "minhduc-wvgz7/drowning-detection-realtime/3"
+    ]
+  }
+}
