@@ -2,7 +2,7 @@ name: Roboflow and Kaggle - Separate Slack Channels
 
 on:
   schedule:
-    - cron: '7,22,37,52 * * * *'
+    - cron: "0 0,12 * * *"
   workflow_dispatch:
 
 permissions:
